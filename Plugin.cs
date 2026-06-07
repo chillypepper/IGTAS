@@ -19,13 +19,17 @@ namespace IGTAS
 
         private MonoBehaviour movementComp;
         private FieldInfo momentumField;
+        private FieldInfo velocityField;
         private FieldInfo bodyField;
         private FieldInfo onGroundField;
+        private FieldInfo OnWallField;
         private FieldInfo dashCooldownField;
-        private FieldInfo dashTimeField;
+        private FieldInfo dashFramesField;
+        private FieldInfo dashFramesRemainingField;
         private FieldInfo moveActionField;
         private FieldInfo jumpActionField;
         private FieldInfo dashActionField;
+        private FieldInfo resetActionField;
 
         private MonoBehaviour pauseMenu;
         private FieldInfo settingsMenuOpenField;
@@ -92,6 +96,7 @@ namespace IGTAS
             { Key.S,          "↓  S"    },
             { Key.Space,      "⎵  Jump" },
             { Key.LeftShift,  "⇧  Dash" },
+            { Key.R,  "⟳ Reset" },
         };
 
         private void Awake()
@@ -298,7 +303,11 @@ namespace IGTAS
 
             HandleTASControls(keyboard);
             if (isEditing) HandleEditorControls(keyboard);
-            if (movementComp == null) TryFindMovement();
+            if (movementComp == null) {
+                TryFindMovement();
+                Logger.LogInfo("TryFindMovement");
+            }
+            ;
         }
 
         private void FixedUpdate()
@@ -471,6 +480,7 @@ namespace IGTAS
 
             RebindSimple(jumpActionField, $"{vkPath}/space");
             RebindSimple(dashActionField, $"{vkPath}/leftShift");
+            RebindSimple(resetActionField, $"{vkPath}/r");
         }
 
         private void ResetActionsToDefault()
@@ -480,6 +490,7 @@ namespace IGTAS
             ResetAction(moveActionField);
             ResetAction(jumpActionField);
             ResetAction(dashActionField);
+            ResetAction(resetActionField);
         }
 
         private void ResetAction(FieldInfo field)
@@ -716,14 +727,18 @@ namespace IGTAS
             if (movementComp == null) return;
 
             Type t = movementComp.GetType();
-            momentumField = t.GetField("momentum", BindingFlags.NonPublic | BindingFlags.Instance);
+            momentumField = t.GetField("momentum", BindingFlags.Public | BindingFlags.Instance);
+            velocityField = t.GetField("Velocity", BindingFlags.Public | BindingFlags.Instance);
             bodyField = t.GetField("body", BindingFlags.NonPublic | BindingFlags.Instance);
             onGroundField = t.GetField("onGround", BindingFlags.NonPublic | BindingFlags.Instance);
-            dashCooldownField = t.GetField("dashCooldown", BindingFlags.NonPublic | BindingFlags.Instance);
-            dashTimeField = t.GetField("dashTime", BindingFlags.NonPublic | BindingFlags.Instance);
+            OnWallField = t.GetField("OnWall", BindingFlags.NonPublic | BindingFlags.Instance);
+            dashCooldownField = t.GetField("dashCooldown", BindingFlags.Public | BindingFlags.Instance);
+            dashFramesRemainingField = t.GetField("dashFramesRemaining", BindingFlags.NonPublic | BindingFlags.Instance);
+            dashFramesField = t.GetField("dashFrames", BindingFlags.NonPublic | BindingFlags.Instance);
             moveActionField = t.GetField("moveAction", BindingFlags.NonPublic | BindingFlags.Instance);
             jumpActionField = t.GetField("jumpAction", BindingFlags.NonPublic | BindingFlags.Instance);
             dashActionField = t.GetField("dashAction", BindingFlags.NonPublic | BindingFlags.Instance);
+            resetActionField = t.GetField("resetAction", BindingFlags.NonPublic | BindingFlags.Instance);
 
             Logger.LogInfo("Movement component found.");
         }
@@ -794,26 +809,29 @@ namespace IGTAS
             {
                 Rigidbody2D body = (Rigidbody2D)bodyField.GetValue(movementComp);
                 bool onGround = onGroundField != null && (bool)onGroundField.GetValue(movementComp);
+                Vector2 Velocity = (Vector2)velocityField.GetValue(movementComp);
                 Vector2 momentum = (Vector2)momentumField.GetValue(movementComp);
                 Single dashCooldown = (Single)dashCooldownField.GetValue(movementComp);
-                Single dashTime = (Single)dashTimeField.GetValue(movementComp);
+                Single dashFramesRemaining = (Single)dashFramesRemainingField.GetValue(movementComp);
                 float dashTimeRemaining = Mathf.Max(0f, dashCooldown);
 
                 Single cooldownAfterDash = (Single)0.3;
                 // calculates currently dashing time also as cooldown
-                if (dashTimeRemaining > 50)
-                {
-                    dashTimeRemaining = dashTimeRemaining - (100 - dashTime) + cooldownAfterDash;
-                }
+                //if (dashTimeRemaining > 50)
+                //{
+                //    //dashTimeRemaining = dashTimeRemaining - (100 - dashTime) + cooldownAfterDash;
+                //}
 
                 string debugText =
                     $"DEBUG:\n" +
                     $"Momentum X: {momentum.x:F2}\n" +
                     $"Momentum Y: {momentum.y:F2}\n\n" +
+                    $"Velocity: {Velocity}\n" +
                     $"Velocity: {body.velocity}\n" +
                     $"Position: {body.position}\n" +
                     $"On Ground: {onGround}\n" +
                     $"Dash Cooldown: {dashTimeRemaining}\n" +
+                    $"dashFramesRemaining: {dashFramesRemaining}\n" +
                     $"Recording: {isRecording}\n" +
                     $"Replaying: {isReplaying}\n" +
                     $"Editing:   {isEditing}\n" +
