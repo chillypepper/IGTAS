@@ -4,3 +4,24 @@ obj/
 
 # vs settings
 .vs/
+
+# environment vars
+.env
+
+# auto-generated TAS recordings (hand-authored .tas files stay tracked)
+inputs/recordings/
+
+# per-playback event timelines (.tas_events from F8 / harness playbacks)
+inputs/playback/
+
+# uv venv for the scene/asset extractor (regenerate per tools/assetparse/README.md)
+tools/assetparse/.venv/
+
+# python bytecode caches
+__pycache__/
+
+# single home for non-source, non-committed trees and files
+artifacts/
+
+# Mono runtime crash dumps dropped in the repo root by a crashed headless game run
+mono_crash.*.json

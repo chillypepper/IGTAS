@@ -13,16 +13,18 @@ using UnityEngine.InputSystem.LowLevel;
 namespace IGTAS
 {
     [BepInPlugin(MyPluginInfo.PLUGIN_GUID, MyPluginInfo.PLUGIN_NAME, MyPluginInfo.PLUGIN_VERSION)]
-    public class Plugin : BaseUnityPlugin
+    public partial class Plugin : BaseUnityPlugin
     {
         internal static new ManualLogSource Logger;
 
         private MonoBehaviour movementComp;
         private FieldInfo momentumField;
+        private FieldInfo movingPlatformVelocityField;
         private FieldInfo velocityField;
         private FieldInfo bodyField;
         private FieldInfo onGroundField;
         private FieldInfo OnWallField;
+        private FieldInfo isDeadField;        // Movement.isDead — death-takeover arming edge + CSV isdead column
         private FieldInfo dashCooldownField;
         private FieldInfo dashFramesField;
         private FieldInfo dashFramesRemainingField;
@@ -52,15 +54,12 @@ namespace IGTAS
         private float deltaTime;
 
         // ===== CONFIG KEYBINDS =====
-        private ConfigEntry<KeyboardShortcut> keybindToggleSlowdown;
         private ConfigEntry<KeyboardShortcut> keybindStartRecord;
         private ConfigEntry<KeyboardShortcut> keybindStopRecord;
         private ConfigEntry<KeyboardShortcut> keybindPlayback;
-        private ConfigEntry<KeyboardShortcut> keybindToggleEditor;
-        private ConfigEntry<KeyboardShortcut> keybindInsertFrame;
-        private ConfigEntry<KeyboardShortcut> keybindRemoveFrame;
-        private ConfigEntry<KeyboardShortcut> keybindEditorPrev;
-        private ConfigEntry<KeyboardShortcut> keybindEditorNext;
+        private ConfigEntry<KeyboardShortcut> keybindToggleHitboxes;
+        private ConfigEntry<KeyboardShortcut> keybindToggleNoclip;
+        private ConfigEntry<KeyboardShortcut> keybindCycleAbilities;
 
         // Built dynamically from config — keys that should never be recorded as gameplay input
         private HashSet<Key> ignoredKeys = new();
@@ -70,16 +69,45 @@ namespace IGTAS
         private int replayIndex = 0;
         private bool isRecording = false;
         private bool isReplaying = false;
-        private bool isSlowdownEnabled = false;
+        // Canonical start boundary. Record (F6), live playback (F8) and the harness all *arm* a run —
+        // set up lockstep, rebind, load — without immediately capturing/playing. The first frame is
+        // gated (ServiceStartGate) until lockstep is confirmed stable, so it always lands on a clean,
+        // fully-settled boundary regardless of which loop (Update or FixedUpdate) armed it — a property
+        // of the system, not an accident of keypress timing, so a recording means the same thing on
+        // live F8 and in the harness. Today readiness = one FixedUpdate elapsed under lockstep since
+        // arming; a future pre-armed boot would satisfy it immediately (only LockstepStartReady
+        // changes). See docs/determinism.md.
+        private enum PendingStart { None, Record, Play }
+        private PendingStart pendingStart = PendingStart.None;
+        private int fixedUpdatesSinceArm;
         private string tasFolder;
+        private string recordingsFolder;
         private string savedInputFile;
+        // True when the loaded buffer was expanded from @commands (e.g. read_file).
+        // Such a buffer is a flattened composition and must not overwrite its source.
+        private bool loadedComposition;
+        // Frames-per-second requested by @frame_rate in the loaded file, applied
+        // during playback and restored on stop.
+        private int? loadedFrameRate;
+        // Mid-run @frame_rate changes (frame index -> fps) from the loaded file, applied as
+        // playback crosses each frame. nextFrameRateIdx is the cursor into it (reset per run).
+        // Presentation-only: changes Application.targetFrameRate, never captureDeltaTime.
+        private List<(int frame, int fps)> loadedFrameRateChanges = new();
+        private int nextFrameRateIdx;
+        private bool frameRateOverridden;
+        private int savedTargetFrameRate;
+        private int savedVSyncCount;
+        private float savedCaptureDeltaTime;
+        // Present rate held during playback (the @frame_rate value, or PhysicsHz default).
+        private int activePresentFps;
+
+        // RNG seed requested by @rng_seed in the loaded file. Applied via Random.InitState
+        // at playback start (BeginPlayback) so the economy/RNG stream reproduces from F8
+        // onward, history-independently.
+        private int? loadedRngSeed;
 
         private HashSet<Key> previouslyDown = new();
         private Keyboard virtualKeyboard;
-
-        // ===== EDITOR =====
-        private bool isEditing = false;
-        private int editFrame = 0;
 
         // ===== REBIND UI =====
         // Index of the keybind row currently awaiting a key press, or -1 if none.
@@ -96,35 +124,36 @@ namespace IGTAS
             { Key.S,          "↓  S"    },
             { Key.Space,      "⎵  Jump" },
             { Key.LeftShift,  "⇧  Dash" },
-            { Key.R,  "⟳ Reset" },
+            { Key.Tab,        "⇄  SwapHud" },
+            { Key.Escape,     "☰  Menu" },
+            { Key.R,          "⟳  Restart" },
         };
+
+        // Singleton self-reference for static Harmony patches (e.g. the freeze coroutine hook)
+        // that need to reach instance state. The plugin is a BepInEx singleton.
+        internal static Plugin PluginInstance;
 
         private void Awake()
         {
             Logger = base.Logger;
+            PluginInstance = this;
 
             const string section = "Keybinds";
-            keybindToggleSlowdown = Config.Bind(section, "ToggleSlowdown", new KeyboardShortcut(KeyCode.F5), "Toggle slowdown mode during record/playback.");
             keybindStartRecord = Config.Bind(section, "StartRecording", new KeyboardShortcut(KeyCode.F6), "Start a new TAS recording.");
             keybindStopRecord = Config.Bind(section, "StopRecording", new KeyboardShortcut(KeyCode.F7), "Stop recording or playback.");
-            keybindPlayback = Config.Bind(section, "StartPlayback", new KeyboardShortcut(KeyCode.F8), "Load and play back the most recent TAS file.");
-            keybindToggleEditor = Config.Bind(section, "ToggleEditor", new KeyboardShortcut(KeyCode.F9), "Open or close the frame editor.");
-            keybindInsertFrame = Config.Bind(section, "InsertFrame", new KeyboardShortcut(KeyCode.F10), "Insert a blank frame after the current editor frame.");
-            keybindRemoveFrame = Config.Bind(section, "RemoveFrame", new KeyboardShortcut(KeyCode.F11), "Remove the current frame in the editor.");
-            keybindEditorPrev = Config.Bind(section, "EditorStepBack", new KeyboardShortcut(KeyCode.LeftArrow), "Step back one frame in the editor.");
-            keybindEditorNext = Config.Bind(section, "EditorStepForward", new KeyboardShortcut(KeyCode.RightArrow), "Step forward one frame in the editor.");
+            keybindPlayback = Config.Bind(section, "StartPlayback", new KeyboardShortcut(KeyCode.F8), "Load and play the main.tas file.");
+            keybindToggleHitboxes = Config.Bind(section, "ToggleHitboxes", new KeyboardShortcut(KeyCode.F4), "Toggle the collider/hitbox overlay.");
+            keybindToggleNoclip = Config.Bind(section, "ToggleNoclip", new KeyboardShortcut(KeyCode.F3), "Toggle debug no-clip flight (WASD to move, Shift to boost).");
+            keybindCycleAbilities = Config.Bind(section, "CycleAbilities", new KeyboardShortcut(KeyCode.F2), "Cycle the player's movement-ability unlock combination.");
 
             keybindDefs = new[]
             {
-                ("Toggle Slowdown",  keybindToggleSlowdown),
                 ("Start Recording",  keybindStartRecord),
                 ("Stop Recording",   keybindStopRecord),
                 ("Playback",         keybindPlayback),
-                ("Toggle Editor",    keybindToggleEditor),
-                ("Insert Frame",     keybindInsertFrame),
-                ("Remove Frame",     keybindRemoveFrame),
-                ("Editor \u25c4 Prev",   keybindEditorPrev),
-                ("Editor \u25ba Next",   keybindEditorNext),
+                ("Toggle Hitboxes",  keybindToggleHitboxes),
+                ("Toggle No-clip",   keybindToggleNoclip),
+                ("Cycle Abilities",  keybindCycleAbilities),
             };
 
             RebuildIgnoredKeys();
@@ -156,7 +185,14 @@ namespace IGTAS
             if (!Directory.Exists(tasFolder))
                 Directory.CreateDirectory(tasFolder);
 
+            // Recordings are written here; playback only ever reads main.tas.
+            recordingsFolder = Path.Combine(tasFolder, "recordings");
+            if (!Directory.Exists(recordingsFolder))
+                Directory.CreateDirectory(recordingsFolder);
+
             InputSystem.onDeviceChange += OnDeviceChange;
+
+            TakeoverInit();
         }
 
         // Lazily initialize styles that depend on GUISkin (must be called inside OnGUI).
@@ -277,6 +313,15 @@ namespace IGTAS
             if (virtualKeyboard != null) return;
             if (change != InputDeviceChange.Added) return;
 
+            EnsureVirtualKeyboard();
+        }
+
+        // Idempotently create the virtual keyboard. Normally triggered reactively by
+        // OnDeviceChange when a real device appears, but the harness calls it directly
+        // because a headless run may have no input devices (so OnDeviceChange never fires).
+        private void EnsureVirtualKeyboard()
+        {
+            if (virtualKeyboard != null) return;
             try
             {
                 virtualKeyboard = InputSystem.AddDevice<Keyboard>("VirtualKeyboard");
@@ -293,42 +338,100 @@ namespace IGTAS
             InputSystem.onDeviceChange -= OnDeviceChange;
             if (virtualKeyboard != null)
                 InputSystem.RemoveDevice(virtualKeyboard);
+            ClearHitboxOverlay();
+            TakeoverShutdown();
         }
 
         private void Update()
         {
             deltaTime += (Time.unscaledDeltaTime - deltaTime) * 0.1f;
+
+            // Hold the present rate during playback. SettingsScript only writes
+            // targetFrameRate at startup / on settings changes (not per frame), so a
+            // one-shot would normally suffice, but re-asserting is cheap insurance.
+            if (frameRateOverridden) Application.targetFrameRate = activePresentFps;
+
             var keyboard = Keyboard.current;
             if (keyboard == null) return;
 
             HandleTASControls(keyboard);
-            if (isEditing) HandleEditorControls(keyboard);
-            if (movementComp == null) {
-                TryFindMovement();
-                Logger.LogInfo("TryFindMovement");
-            }
-            ;
+
+            // Frozen-time frame advance (the dual-clock model): while physics is FROZEN
+            // (timeScale=0 -> no FixedUpdate), Update becomes the live authority and advances the
+            // SAME frame list, so a freeze is an AUTHORED/DERIVED frame count, not one measured off
+            // the free-running render rate. Drives the dash-freeze takeover (and the authored
+            // pause). See docs/harness.md + TakeoverRegistrations.cs.
+            if (Time.timeScale == 0f)
+                TakeoverAdvanceFrozen();
+
+            // Render-only overlay.
+            if (hitboxOverlayEnabled) UpdateHitboxOverlay();
+            if (movementComp == null) TryFindMovement();
         }
 
         private void FixedUpdate()
         {
+            // No-clip forks game physics, so it must never overlap the determinism
+            // path: if a TAS run begins while it's on, force it off first.
+            if (noclipEnabled && (isRecording || isReplaying)) DisableNoclip();
+            if (noclipEnabled) NoclipFixedTick();
+
+            // Service the canonical start gate: a run armed on tick T is promoted on T+1, so
+            // frame-0 always lands one full Update→FixedUpdate cycle into stable lockstep.
+            ServiceStartGate();
+
             if (isRecording) CaptureFrame();
             if (isReplaying) PlayFrame();
         }
+
+        // Promote a pending (armed) run to active once lockstep is confirmed stable. While a
+        // start is pending, no frame is captured/played — this is the transition buffer. The
+        // FixedUpdate that promotes the run also does not capture/play (it falls through with
+        // isRecording/isReplaying still false this tick); the first real frame is the NEXT
+        // FixedUpdate, one full Update→FixedUpdate cycle into stable lockstep.
+        private void ServiceStartGate()
+        {
+            if (pendingStart == PendingStart.None) return;
+
+            if (!LockstepStartReady())
+            {
+                fixedUpdatesSinceArm++;
+                return;
+            }
+
+            // Activate under the unified TAS regime: render-independent transform (interpolation
+            // off) so capture and replay share one deterministic ruler, alongside the lockstep
+            // already applied at arm time. Done here, at activation, where the player body is
+            // guaranteed resolved (after the arming buffer), for both record and playback.
+            ApplyTasInterpolation();
+            TakeoverReset();
+
+            if (pendingStart == PendingStart.Record) isRecording = true;
+            else if (pendingStart == PendingStart.Play) isReplaying = true;
+            pendingStart = PendingStart.None;
+        }
+
+        // Readiness for the start gate: at least one FixedUpdate elapsed under lockstep since arming,
+        // so the action rebind has been through a full Update/InputSystem cycle before the first input
+        // is sampled. (The single point a future pre-armed boot would relax — see the pendingStart field.)
+        private bool LockstepStartReady() => frameRateOverridden && fixedUpdatesSinceArm >= 1;
 
         // ==============================
         // RECORDING
         // ==============================
         private void CaptureFrame()
         {
+            // Behaviour takeovers during recording too, so a recorded death respawns on the
+            // canonical frame and record/playback agree (TakeoverRegistrations.cs).
+            TakeoverNormalTick();
+
             var keyboard = Keyboard.current;
             if (keyboard == null) return;
 
             var snapshot = new FrameInputSnapshot();
 
-            foreach (Key key in Enum.GetValues(typeof(Key)))
+            foreach (Key key in Inputs.SupportedKeys)
             {
-                if (key == Key.None) continue;
                 if (ignoredKeys.Contains(key)) continue;
 
                 var ctrl = keyboard[key];
@@ -357,6 +460,48 @@ namespace IGTAS
         // ==============================
         // PLAYBACK
         // ==============================
+
+        // Shared playback entry point used by the F8 hotkey and the harness.
+        private void BeginPlayback(string file)
+        {
+            // Create the virtual keyboard for the run (rebound below; removed at plugin teardown).
+            EnsureVirtualKeyboard();
+            savedInputFile = file;
+
+            LoadRecording(file);
+            ApplyFrameRate();
+            ApplyPlaybackRngSeed();
+            RebindActionsToVirtualKeyboard();
+
+            // Arm, don't activate: the start gate (ServiceStartGate) promotes this to
+            // isReplaying once lockstep is confirmed stable, so the first PlayFrame lands on
+            // the canonical start boundary regardless of whether F8 (Update) or the harness
+            // (FixedUpdate) called us. replayIndex is reset now so frame-0 plays first.
+            isRecording = false;
+            isReplaying = false;
+            pendingStart = PendingStart.Play;
+            fixedUpdatesSinceArm = 0;
+            replayIndex = 0;
+            nextFrameRateIdx = 0;
+
+            // Optional per-frame state CSV for a live F8 run, so two runs can be diffed
+            // frame-by-frame to localise drift. Gated on IGTAS_LIVE_STATE_LOG; default
+            // path is playback/<timestamp>.state.csv.
+            OpenLiveStateLog();
+
+            Logger.LogInfo($"Playback started from {file}");
+        }
+
+        // Apply the file's @rng_seed at playback start (see loadedRngSeed field).
+        // ⚠️ Draw-order limit (not a bug): objects whose Start() ran BEFORE F8 keep their drawn phase
+        // offsets; a route entering its zones after F8 (the normal case) is fully covered. docs/determinism.md.
+        private void ApplyPlaybackRngSeed()
+        {
+            if (!loadedRngSeed.HasValue) return;   // no @rng_seed directive: leave RNG untouched
+            UnityEngine.Random.InitState(loadedRngSeed.Value);
+            Logger.LogInfo($"Playback seeded UnityEngine.Random with {loadedRngSeed.Value} (@rng_seed).");
+        }
+
         private void PlayFrame()
         {
             if (virtualKeyboard == null) { StopPlayback(); return; }
@@ -367,6 +512,21 @@ namespace IGTAS
                 return;
             }
 
+            PlayFrameBody();
+        }
+
+        private void PlayFrameBody()
+        {
+            // Behaviour takeovers (death respawn, …) before the state log so a respawn fired this
+            // frame shows in this frame's row. See TakeoverRegistrations.cs.
+            TakeoverNormalTick();
+
+            // Apply any @frame_rate change(s) that take effect at or before this frame (presentation
+            // only — Update re-asserts activePresentFps every frame; physics stays 1/50). A run
+            // authored with several @frame_rate directives changes speed at each point, not just
+            // once for the whole file.
+            ApplyFrameRateChangesUpTo(replayIndex);
+
             var snapshot = recordedFrames[replayIndex];
             var keyboardState = new KeyboardState();
 
@@ -375,88 +535,155 @@ namespace IGTAS
                     keyboardState.Set(kv.Key, true);
 
             InputSystem.QueueStateEvent(virtualKeyboard, keyboardState, InputState.currentTime);
+            if (liveStateLogging) HarnessLogState(replayIndex);
             replayIndex++;
         }
 
         private void StopPlayback()
         {
             isReplaying = false;
+            pendingStart = PendingStart.None; // in case playback is stopped while still arming
             replayIndex = 0;
 
             if (virtualKeyboard != null)
                 InputSystem.QueueStateEvent(virtualKeyboard, new KeyboardState(), InputState.currentTime);
 
             ResetActionsToDefault();
+            RestoreFrameRate();
+            RestoreTasInterpolation();
+            CloseLiveStateLog();
             Logger.LogInfo("Playback complete.");
 
-            Time.timeScale = 1f;
+            // Hand every in-flight takeover back to the game: un-freeze a held dash freeze (else
+            // the game hangs at timeScale=0 — we skipped Unity's scheduler; a menu-held pause is
+            // left paused), re-Invoke a pending death respawn so the player isn't stranded dead.
+            TakeoverStopAll();
         }
 
-        // ==============================
-        // EDITOR
-        // ==============================
-        private void EnterEditor()
+        // ===== LIVE PER-FRAME STATE LOG (diagnostic) =====
+        // Emits the per-frame whole-game state CSV (the StateLog emitter) for a live F8 run, so two
+        // runs can be diffed frame-by-frame to localise drift. Off unless IGTAS_LIVE_STATE_LOG is
+        // set (to "1" for the default playback/<ts>.state.csv path, or to an explicit path).
+        // Inert in normal play.
+        private bool liveStateLogging;
+
+        private void OpenLiveStateLog()
         {
-            if (recordedFrames.Count == 0) { Logger.LogWarning("No frames to edit."); return; }
+            string v = System.Environment.GetEnvironmentVariable("IGTAS_LIVE_STATE_LOG");
+            if (string.IsNullOrEmpty(v)) return;
 
-            isEditing = true;
-            isReplaying = false;
-            isRecording = false;
-            editFrame = Mathf.Clamp(editFrame, 0, recordedFrames.Count - 1);
+            string path = (v == "1" || v == "true")
+                ? Path.Combine(tasFolder, "playback", $"{DateTime.Now:yyyyMMdd_HHmmss}.state.csv")
+                : v;
+            try { Directory.CreateDirectory(Path.GetDirectoryName(path)); }
+            catch (Exception e) { Logger.LogWarning($"Could not open live state log {path}: {e.Message}"); return; }
 
-            Time.timeScale = 0f;
-            Logger.LogInfo($"Editor opened at frame {editFrame}.");
-        }
-
-        private void ExitEditor()
-        {
-            isEditing = false;
-            Time.timeScale = 1f;
-
-            if (savedInputFile != null)
+            if (OpenStateLog(path, "Live state log"))
             {
-                SaveRecording(savedInputFile);
-                Logger.LogInfo("Editor closed, changes saved.");
+                liveStateLogging = true;
+                Logger.LogInfo($"Live state log writing to {path}");
             }
         }
 
-        private void HandleEditorControls(Keyboard keyboard)
+        private void CloseLiveStateLog()
         {
-            if (keybindEditorPrev.Value.IsDown())
-                editFrame = Mathf.Max(0, editFrame - 1);
+            if (!liveStateLogging) return;
+            liveStateLogging = false;
+            Logger.LogInfo($"Live state log: frames={harnessFrames} hash=0x{harnessHash:X16} fullhash=0x{harnessFullHash:X16}");
+            harnessStateLog?.Flush();
+            harnessStateLog?.Dispose();
+            harnessStateLog = null;
+        }
 
-            if (keybindEditorNext.Value.IsDown())
-                editFrame = Mathf.Min(recordedFrames.Count - 1, editFrame + 1);
+        // The game's physics is a fixed 50 Hz (Time.fixedDeltaTime == 0.02, movement hard-normalised
+        // to it). Lockstep pins every render frame to one physics step via captureDeltaTime; @frame_rate
+        // is presentation-only. Full reasoning: docs/tas_inputs.md (@frame_rate) + docs/determinism.md.
+        private const int PhysicsHz = 50;
 
-            foreach (Key key in Enum.GetValues(typeof(Key)))
+        private void ApplyFrameRate()
+        {
+            // Idempotent on the saved restore-values: the harness enables lockstep
+            // early (so the settle window is deterministic) and BeginPlayback calls
+            // this again once the file's @frame_rate is known. Only capture the
+            // originals on the first apply, or the second call would save the
+            // already-locked values and RestoreFrameRate couldn't undo them.
+            if (!frameRateOverridden)
             {
-                if (key == Key.None) continue;
-                if (ignoredKeys.Contains(key)) continue;
-
-                var ctrl = keyboard[key];
-                if (ctrl == null || !ctrl.wasPressedThisFrame) continue;
-
-                var frame = recordedFrames[editFrame];
-
-                if (frame.keyStates.TryGetValue(key, out var existing))
-                {
-                    if (existing.isDown)
-                    {
-                        frame.keyStates.Remove(key);
-                        Logger.LogInfo($"Frame {editFrame}: removed {key}");
-                    }
-                    else
-                    {
-                        existing.isDown = true;
-                        Logger.LogInfo($"Frame {editFrame}: set {key} down");
-                    }
-                }
-                else
-                {
-                    frame.keyStates[key] = new KeySnapshot { isDown = true, wentDown = true, wentUp = false };
-                    Logger.LogInfo($"Frame {editFrame}: added {key}");
-                }
+                savedVSyncCount = QualitySettings.vSyncCount;
+                savedTargetFrameRate = Application.targetFrameRate;
+                savedCaptureDeltaTime = Time.captureDeltaTime;
             }
+
+            // vSync would clamp the present rate to the monitor and ignore
+            // targetFrameRate, so the speed knob needs it off.
+            QualitySettings.vSyncCount = 0;
+            // Present rate: an explicit @frame_rate (loadedFrameRate) wins (so a slow-mo/debug rate
+            // in a .tas is honoured); else real-time (PhysicsHz). Physics is 1/50 either way
+            // (captureDeltaTime), so this only changes how fast the deterministic frames are shown.
+            activePresentFps = loadedFrameRate ?? PhysicsHz;
+            Application.targetFrameRate = activePresentFps;
+            Time.captureDeltaTime = 1f / PhysicsHz;
+            frameRateOverridden = true;
+
+            Logger.LogInfo($"Lockstep playback: physics={PhysicsHz} Hz, present={activePresentFps} fps (captureDeltaTime={Time.captureDeltaTime:F4}).");
+        }
+
+        // Drain the @frame_rate change cursor up to (and including) the given frame. Each mid-run
+        // directive only updates the present rate (activePresentFps + targetFrameRate); the Update
+        // re-assert holds it. Idempotent past the end of the list; the cursor only moves forward.
+        private void ApplyFrameRateChangesUpTo(int frameIndex)
+        {
+            while (nextFrameRateIdx < loadedFrameRateChanges.Count
+                   && loadedFrameRateChanges[nextFrameRateIdx].frame <= frameIndex)
+            {
+                int fps = loadedFrameRateChanges[nextFrameRateIdx].fps;
+                activePresentFps = fps;
+                Application.targetFrameRate = fps;
+                nextFrameRateIdx++;
+                Logger.LogInfo($"@frame_rate -> {fps} fps at frame {frameIndex}.");
+            }
+        }
+
+        private void RestoreFrameRate()
+        {
+            if (!frameRateOverridden) return;
+
+            Time.captureDeltaTime = savedCaptureDeltaTime; // back to wall-clock timing
+            Application.targetFrameRate = savedTargetFrameRate;
+            QualitySettings.vSyncCount = savedVSyncCount;
+            frameRateOverridden = false;
+        }
+
+        // The player Rigidbody2D ships with interpolation ON (a render feature), but the game's
+        // movement raycasts read transform.position — so interpolation leaks render timing into
+        // gameplay: the transform lags body.position by a render-frame fraction live but a full
+        // physics step headless, diverging a live recording from a headless replay. We force
+        // interpolation = None during any TAS run so transform = body each physics step in BOTH —
+        // one render-independent ruler. Reversible if the game moves its raycasts to FixedUpdate;
+        // restored on stop. Full reasoning: docs/determinism.md ("Player-body interpolation").
+        private bool interpolationOverridden;
+        private RigidbodyInterpolation2D savedInterpolation;
+
+        private void ApplyTasInterpolation()
+        {
+            if (interpolationOverridden) return;
+            if (movementComp == null) TryFindMovement();
+            if (movementComp == null || bodyField == null) return;
+            if (bodyField.GetValue(movementComp) is not Rigidbody2D body) return;
+
+            savedInterpolation = body.interpolation;
+            body.interpolation = RigidbodyInterpolation2D.None;
+            interpolationOverridden = true;
+            Logger.LogInfo($"TAS: body.interpolation {savedInterpolation} -> None (render-independent transform).");
+        }
+
+        private void RestoreTasInterpolation()
+        {
+            if (!interpolationOverridden) return;
+            interpolationOverridden = false;
+            if (movementComp != null && bodyField != null
+                && bodyField.GetValue(movementComp) is Rigidbody2D body)
+                body.interpolation = savedInterpolation;
         }
 
         // ==============================
@@ -546,54 +773,19 @@ namespace IGTAS
         // ==============================
         // SAVE / LOAD
         // ==============================
-        private void SaveRecording(string path)
-        {
-            using var fs = new FileStream(path, FileMode.Create);
-            using var bw = new BinaryWriter(fs);
-
-            bw.Write(recordedFrames.Count);
-            foreach (var frame in recordedFrames)
-            {
-                bw.Write(frame.keyStates.Count);
-                foreach (var kv in frame.keyStates)
-                {
-                    bw.Write((int)kv.Key);
-                    bw.Write(kv.Value.isDown);
-                    bw.Write(kv.Value.wentDown);
-                    bw.Write(kv.Value.wentUp);
-                }
-            }
-
-            Logger.LogInfo($"Saved {recordedFrames.Count} frames.");
-        }
+        // File handling and the text format live in Inputs; the in-memory
+        // model (recordedFrames) is independent of the disk format.
+        private void SaveRecording(string path) => Inputs.Save(path, recordedFrames);
 
         private void LoadRecording(string path)
         {
-            if (!File.Exists(path)) return;
+            var result = Inputs.Load(path);
             recordedFrames.Clear();
-
-            using var fs = new FileStream(path, FileMode.Open);
-            using var br = new BinaryReader(fs);
-
-            int frameCount = br.ReadInt32();
-            for (int i = 0; i < frameCount; i++)
-            {
-                var frame = new FrameInputSnapshot();
-                int keyCount = br.ReadInt32();
-                for (int j = 0; j < keyCount; j++)
-                {
-                    var key = (Key)br.ReadInt32();
-                    frame.keyStates[key] = new KeySnapshot
-                    {
-                        isDown = br.ReadBoolean(),
-                        wentDown = br.ReadBoolean(),
-                        wentUp = br.ReadBoolean()
-                    };
-                }
-                recordedFrames.Add(frame);
-            }
-
-            Logger.LogInfo($"Loaded {recordedFrames.Count} frames.");
+            recordedFrames.AddRange(result.Frames);
+            loadedComposition = result.HadCommands;
+            loadedFrameRate = result.FrameRate;
+            loadedFrameRateChanges = result.FrameRateChanges;
+            loadedRngSeed = result.RngSeed;
         }
 
         // ==============================
@@ -630,88 +822,79 @@ namespace IGTAS
             // Block all TAS hotkeys while waiting for a rebind key press.
             if (rebindingIndex >= 0) return;
 
-            if (IsBindingPressed(keybindToggleSlowdown))
+            if (IsBindingPressed(keybindToggleHitboxes))
+                ToggleHitboxOverlay();
+
+            // Debug-only tools that deliberately fork game behaviour — keep them out
+            // of the determinism path entirely (no TAS record/playback, no harness).
+            bool tasBusy = isRecording || isReplaying;
+            if (!tasBusy)
             {
-                isSlowdownEnabled = !isSlowdownEnabled;
-                Logger.LogInfo($"Slowdown {(isSlowdownEnabled ? "enabled" : "disabled")}.");
+                if (IsBindingPressed(keybindToggleNoclip)) ToggleNoclip();
+                if (IsBindingPressed(keybindCycleAbilities)) CycleAbilities();
             }
 
             if (IsBindingPressed(keybindStartRecord))
             {
-                if (isEditing) ExitEditor();
-
-                if (isSlowdownEnabled)
-                    Time.timeScale = 0.1f;
-
-                isRecording = true;
+                // Arm, don't activate: the start gate promotes this to isRecording on the
+                // canonical start boundary (the same one playback uses), so frame-0 is captured
+                // one full Update→FixedUpdate cycle into stable lockstep — matching how the
+                // recording will later be played back.
+                isRecording = false;
                 isReplaying = false;
+                pendingStart = PendingStart.Record;
+                fixedUpdatesSinceArm = 0;
+                loadedComposition = false;
                 recordedFrames.Clear();
                 previouslyDown.Clear();
-                savedInputFile = Path.Combine(tasFolder, $"tas_{DateTime.Now:yyyyMMdd_HHmmss}.bin");
+                savedInputFile = Path.Combine(recordingsFolder, $"tas_{DateTime.Now:yyyyMMdd_HHmmss}.tas");
+
+                // Capture under the SAME lockstep regime as playback. Without this,
+                // CaptureFrame samples at a free-running, wall-clock-coupled render/
+                // physics phase while BeginPlayback replays under captureDeltaTime
+                // lockstep — so the recorded frames don't mean the same thing on
+                // replay and a long route drifts off its path. Recording has no
+                // @frame_rate file, so loadedFrameRate is null and ApplyFrameRate
+                // presents at real-time (50 fps) — physics is 1/50 either way.
+                loadedFrameRate = null;
+                ApplyFrameRate();
                 Logger.LogInfo("Recording started.");
             }
 
             if (IsBindingPressed(keybindStopRecord))
             {
+                // Stop while still arming (gate hasn't promoted yet): unwind the arm so we
+                // don't leave lockstep applied with no active run.
+                if (pendingStart != PendingStart.None)
+                {
+                    pendingStart = PendingStart.None;
+                    RestoreFrameRate();
+                }
                 if (isRecording)
                 {
                     isRecording = false;
+                    RestoreFrameRate();
+                    RestoreTasInterpolation();
                     SaveRecording(savedInputFile);
                     Logger.LogInfo("Recording stopped.");
                 }
                 if (isReplaying) StopPlayback();
 
-                Time.timeScale = 1f;
+                // Hand in-flight takeovers back to the game (un-freeze a cancelled dash freeze,
+                // re-Invoke a pending death respawn). StopPlayback already does this for the replay
+                // case, but a stopped *recording* needs it too.
+                TakeoverStopAll();
             }
 
             if (IsBindingPressed(keybindPlayback))
             {
-                if (isEditing) ExitEditor();
+                // main.tas is the single entrypoint; it may pull in other files
+                // via @read_file. Recordings live in recordings/ and are only
+                // played by referencing them from main.tas.
+                string mainTas = Path.Combine(tasFolder, "main.tas");
+                if (!File.Exists(mainTas)) { Logger.LogWarning("No main.tas found in TAS folder."); return; }
 
-                string[] files = Directory.GetFiles(tasFolder, "tas_*.bin");
-                if (files.Length == 0) { Logger.LogWarning("No TAS files found."); return; }
-
-                if (isSlowdownEnabled)
-                    Time.timeScale = 0.1f;
-
-                Array.Sort(files);
-                savedInputFile = files[files.Length - 1];
-                LoadRecording(savedInputFile);
-                RebindActionsToVirtualKeyboard();
-
-                isRecording = false;
-                isReplaying = true;
-                replayIndex = 0;
-
-                Logger.LogInfo($"Playback started from {savedInputFile}");
-            }
-
-            if (IsBindingPressed(keybindToggleEditor))
-            {
-                if (isEditing) ExitEditor();
-                else EnterEditor();
-            }
-
-            if (IsBindingPressed(keybindInsertFrame) && isEditing)
-            {
-                int insertAt = Mathf.Clamp(editFrame + 1, 0, recordedFrames.Count);
-                recordedFrames.Insert(insertAt, new FrameInputSnapshot());
-                editFrame = insertAt;
-                Logger.LogInfo($"Inserted blank frame at {insertAt}. Total: {recordedFrames.Count}");
-            }
-
-            if (IsBindingPressed(keybindRemoveFrame) && isEditing)
-            {
-                if (recordedFrames.Count > 1)
-                {
-                    recordedFrames.RemoveAt(editFrame);
-                    editFrame = Mathf.Clamp(editFrame, 0, recordedFrames.Count - 1);
-                    Logger.LogInfo($"Removed frame. Now at {editFrame}. Total: {recordedFrames.Count}");
-                }
-                else
-                {
-                    Logger.LogWarning("Can't remove last remaining frame.");
-                }
+                BeginPlayback(mainTas);
             }
         }
 
@@ -728,10 +911,12 @@ namespace IGTAS
 
             Type t = movementComp.GetType();
             momentumField = t.GetField("momentum", BindingFlags.Public | BindingFlags.Instance);
+            movingPlatformVelocityField = t.GetField("movingPlatformVelocity", BindingFlags.Public | BindingFlags.Instance);
             velocityField = t.GetField("Velocity", BindingFlags.Public | BindingFlags.Instance);
             bodyField = t.GetField("body", BindingFlags.NonPublic | BindingFlags.Instance);
             onGroundField = t.GetField("onGround", BindingFlags.NonPublic | BindingFlags.Instance);
             OnWallField = t.GetField("OnWall", BindingFlags.NonPublic | BindingFlags.Instance);
+            isDeadField = t.GetField("isDead", BindingFlags.NonPublic | BindingFlags.Instance);
             dashCooldownField = t.GetField("dashCooldown", BindingFlags.Public | BindingFlags.Instance);
             dashFramesRemainingField = t.GetField("dashFramesRemaining", BindingFlags.NonPublic | BindingFlags.Instance);
             dashFramesField = t.GetField("dashFrames", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -796,6 +981,17 @@ namespace IGTAS
             return string.Join("+", parts);
         }
 
+        // The present rate (@frame_rate) that takes effect AT this frame, or null if none changes here:
+        // the starting rate at frame 0, or a mid-run change keyed to this frame. Drives the sidebar
+        // markers so a run's speed changes are visible in the frame list during playback.
+        private int? FrameRateAtFrame(int frame)
+        {
+            if (frame == 0 && loadedFrameRate.HasValue) return loadedFrameRate;
+            for (int i = 0; i < loadedFrameRateChanges.Count; i++)
+                if (loadedFrameRateChanges[i].frame == frame) return loadedFrameRateChanges[i].fps;
+            return null;
+        }
+
         private void OnGUI()
         {
             GUI.depth = -1000;
@@ -804,6 +1000,8 @@ namespace IGTAS
             float fps = 1.0f / deltaTime;
             GUI.Label(new Rect(0, 0, Screen.width, 25), $"FPS: {fps:F1}", fpsStyle);
             GUI.Label(new Rect(0, 25, Screen.width, 50), "MODDED", topCenterStyle);
+
+            if (hitboxOverlayEnabled) { DrawHitboxLegend(); DrawHitboxLabels(); }
 
             if (movementComp != null && bodyField != null)
             {
@@ -814,13 +1012,6 @@ namespace IGTAS
                 Single dashCooldown = (Single)dashCooldownField.GetValue(movementComp);
                 Single dashFramesRemaining = (Single)dashFramesRemainingField.GetValue(movementComp);
                 float dashTimeRemaining = Mathf.Max(0f, dashCooldown);
-
-                Single cooldownAfterDash = (Single)0.3;
-                // calculates currently dashing time also as cooldown
-                //if (dashTimeRemaining > 50)
-                //{
-                //    //dashTimeRemaining = dashTimeRemaining - (100 - dashTime) + cooldownAfterDash;
-                //}
 
                 string debugText =
                     $"DEBUG:\n" +
@@ -834,24 +1025,24 @@ namespace IGTAS
                     $"dashFramesRemaining: {dashFramesRemaining}\n" +
                     $"Recording: {isRecording}\n" +
                     $"Replaying: {isReplaying}\n" +
-                    $"Editing:   {isEditing}\n" +
-                    $"Slowdown Enabled:   {isSlowdownEnabled}\n" +
-                    $"Replay: {replayIndex}/{recordedFrames.Count}";
+                    $"Replay: {replayIndex}/{recordedFrames.Count}\n" +
+                    $"No-clip (F3): {(noclipEnabled ? "ON" : "off")}\n" +
+                    $"Abilities (F2): {CurrentAbilityLabel()}";
 
-                GUI.Label(new Rect(10, 10, 400, 240), debugText, debugStyle);
+                GUI.Label(new Rect(10, 10, 400, 280), debugText, debugStyle);
             }
 
             // ---- Keybind panel (visible when settings screen is open) ----
             if (IsSettingsScreenOpen())
                 DrawRebindPanel();
 
-            // ---- Frame editor sidebar ----
-            if ((isEditing || isReplaying) && recordedFrames.Count > 0)
+            // ---- Replay frame sidebar ----
+            if (isReplaying && recordedFrames.Count > 0)
             {
-                int currentFrame = isEditing ? editFrame : replayIndex - 1;
+                int currentFrame = replayIndex - 1;
                 int visibleCount = 10;
                 int rowHeight = 28;
-                int sidebarWidth = 220;
+                int sidebarWidth = 260;
                 int totalHeight = visibleCount * rowHeight;
                 int startY = (Screen.height - totalHeight) / 2;
                 int startX = 10;
@@ -870,6 +1061,9 @@ namespace IGTAS
 
                     bool isCurrent = frameIdx == currentFrame;
                     string label = $"[{frameIdx:D4}]  {FrameToString(frameIdx)}";
+                    // Mark a frame where @frame_rate changes (or the starting rate at frame 0).
+                    int? rateHere = FrameRateAtFrame(frameIdx);
+                    if (rateHere.HasValue) label += $"   » {rateHere.Value}fps";
                     var style = isCurrent ? sidebarHighlightStyle
                                        : (Mathf.Abs(frameIdx - currentFrame) > 3 ? sidebarDimStyle : sidebarStyle);
 
@@ -881,17 +1075,6 @@ namespace IGTAS
                     }
 
                     GUI.Label(new Rect(startX, startY + i * rowHeight, sidebarWidth, rowHeight), label, style);
-                }
-
-                if (isEditing)
-                {
-                    GUI.color = new Color(1, 1, 0, 0.9f);
-                    GUI.Label(
-                        new Rect(startX, startY + totalHeight + 8, sidebarWidth, 80),
-                        "\u25c4 \u25ba  step frame\nAny key  toggle\nF10  insert frame\nF11  remove frame\nF9  save & exit",
-                        sidebarStyle
-                    );
-                    GUI.color = Color.white;
                 }
             }
         }

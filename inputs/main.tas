@@ -1,0 +1,8 @@
+# Welcome to the main.tas entrypoint! Examples of 2 commands are included below, but the real example is in the file linked in @read_file
+# Feel free to edit this file directly while you're testing, or to start building segments to chain them together for longer TAS efforts
+
+# Set a frame rate,, or uncap it with -1
+@frame_rate=-1
+
+# Read a file (allows for composing segments) from `./inputs`
+@read_file=to-first-clone

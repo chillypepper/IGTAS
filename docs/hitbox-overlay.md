@@ -1,0 +1,141 @@
+# Hitbox / collider overlay
+
+A render-only diagnostic overlay that draws every relevant `Collider2D` in the scene as a coloured outline, **labelled by what the collider *does*** (player, solid/mossy ground, spike, checkpoint, gate, zone changer, spring, upgrade box, …) rather than by its Unity component type, plus **per-instance value labels** where a mechanic's magnitude varies (spring strength, long-fall multiplier, upgrade-box target). It makes collision inspection and TAS-route tuning quick and visual, with no second plugin to maintain.
+
+- **Toggle:** `F4` (rebindable — `Keybinds/ToggleHitboxes`).
+- **Code:** [HitboxOverlay.cs](../HitboxOverlay.cs) (a `partial class Plugin`), wired into [Plugin.cs](../Plugin.cs) (keybind, `Update` call, `OnGUI` legend + labels, `OnDestroy` cleanup).
+- **Tuning:** `HitboxLineWidthPx` (on-screen line thickness in **pixels**, default `2`) and `HitboxUpdateRate` (frames between refreshes, default `1`) are **compile-time constants** in `HitboxOverlay.cs`, deliberately *not* BepInEx config — see [Line width & the config-persistence trap](#line-width--the-config-persistence-trap).
+
+## North star — playable from the hitboxes alone
+
+**The game should be fully playable using only the hitbox overlay, with no game sprites.** That is the design test every classification and label decision is measured against:
+
+- If a collider **behaves differently on contact**, it must **look different** — a distinct colour for a distinct interaction. (This is why mossy ground, springs and long-fall zones are not lumped into generic buckets, and why a "looks solid but you fall through it" collider is coloured differently from real ground.)
+- If the interaction's **magnitude varies per instance** (and isn't already obvious from the collider's size), it gets a **per-instance label** showing the value (e.g. a spring's strength). A single colour can't convey "this spring throws you twice as far as that one."
+- Purely cosmetic volumes (camera, music, tutorial text) are allowed to share one muted colour — they don't affect play, so the player never needs to tell them apart.
+
+When adding or re-checking a collider category, ask: *could a player who can only see the hitboxes predict what happens when they touch this?* If not, it needs a colour or a label. This bar is what drives the colour/hatch/label scheme below, and it is the standard to hold against future game updates.
+
+## Why this instead of an existing plugin
+
+The trigger for this work was [Rostmoment/HitboxViewer](https://github.com/Rostmoment/HitboxViewer) (vendored under `artifacts/RostMomentHitboxViewer/` as a reference, **excluded from our build** in `IGTAS.csproj`). It is a capable, generic BepInEx 5 hitbox viewer, but for our purposes:
+
+- **~Half of it is irrelevant.** IGTAP is 2D; HitboxViewer's bulk is 3D colliders (Sphere/Capsule/Mesh/CharacterController/NavMesh) and four rounded-hitbox drawing algorithms we'd never use.
+- **Its labelling ceiling is too low.** Its entire vocabulary is the Unity component *type* plus `isTrigger`. In IGTAP almost every gameplay volume — spikes, checkpoints, gates, zone changers, springs, upgrade boxes, solid ground — is a plain `BoxCollider2D`, so a generic viewer paints them all the same colour. The whole value of an in-house pass is exactly what the generic tool can't do: **we know each collider's owning gameplay script** (from `artifacts/decompiled/`), so we classify and colour by behaviour. That semantic layer is what makes the north star above achievable at all.
+- **Dependency weight.** HitboxViewer pulls UniverseLib for its in-game UI; we already have a GUI/HUD in `Plugin.cs`, so we drive everything from a small `OnGUI` legend and take on zero new dependencies.
+
+Conclusion: borrow the *technique*, not the code.
+
+## What we borrowed (and how it's drawn)
+
+The *technique* from HitboxViewer's `BaseDisplayer`, not its code: per collider, a child `GameObject` with a `LineRenderer` draws the outline in world space, `sortingOrder = short.MaxValue` so lines sit over sprites. The `Plugin` partial manages a flat `Dictionary<Collider2D, List<LineRenderer>>` under one parent object — **no new `MonoBehaviour` types**, teardown is a single `Destroy` (the value is a *list* because a `CompositeCollider2D` needs one renderer per merged path). Per-shape outline maths + the shared-material fallback chain are in [HitboxOverlay.cs](../HitboxOverlay.cs). Dropped from HitboxViewer: UniverseLib, the in-game menu, 3D colliders, the rounded-hitbox algorithms; `CapsuleCollider2D` is approximated as its bounding box (none expected on this game's geometry).
+
+Two non-obvious points worth keeping:
+
+- **Every interior shape is inset inward by half the line width** so the drawn border's *outer* edge lands on the true collider edge — without it the centred `LineRenderer` reads ~½-width larger and bleeds outward. (`EdgeCollider2D` is the exception — an open polyline, drawn on-edge; none on gameplay geometry today.)
+- **Tilemap ground is drawn from its `CompositeCollider2D`** (`TilemapCollider2D usedByComposite` → a sibling composite holding the real merged collision as disjoint polygon paths). The overlay outlines those paths, so the whole solid layer is visible; a composited tilemap is skipped (the composite covers it), a *non*-composited one falls back to a coarse bounds-box. Live geometry, never a baked dump.
+
+## Classification
+
+`ClassifyHitbox` decides colour/visibility in this precedence order. **Everything is shown** — there is no "hidden" category; the two fallbacks guarantee no collider is silently dropped.
+
+1. **Player** — tag `Player`, or carries the `Movement` component → **cyan**.
+2. **Owning gameplay script** (checked on the collider's GameObject *and* its parent). Most map via the static `scriptCategories` name→colour table; a few are **special-cased directly in `ClassifyHitbox` before the table** because their colour/hatch depends on which script or on live state, so they are **not** in the table — don't go looking for them there:
+   - **`startGate` / `endGate`** → teal `ColGate` base + a start/end hatch.
+   - **`longFallColliderController`** → orange base + an active/reset hatch (read from the instance's `NewCutsceneMode`).
+   - **`upgradeBox`** → orange base + an optional red/blue *warning* hatch read from the live instance (`UpgradeBoxHatch`): **red** if it radically reshapes the game (`tripBreaker` `[SerializeField] bool` set, or the `endDemo` movement target), **blue** if it grants a movement ability (any other `Movement`-kind box), else no hatch. The table is the fallthrough for everything else:
+
+   | Category | Scripts | Colour (+ hatch) | Why distinct |
+   |---|---|---|---|
+   | Hazard | `spikeScript` | red | kills the player (`onDeath`) |
+   | Spring | `SpringScript` | pink | launches the player (`hitSpring`); **labelled** with strength + drawn with a **launch-direction arrow** (live `transform.up`) |
+   | Long fall | `longFallColliderController`, `JiggleDropScript` | burnt orange + hatch (active = bright orange / reset = dark brown) | `longfall`-mode raises fall terminal velocity by `longFallMult`; `none`-mode is inert (only forces `cutsceneMode→none`, cancelling a spring/cutscene). Same base, **hatch** says which; **labelled** `{mult}x fall` / `reset` |
+   | Checkpoint | `checkpointScript` | blue | sets respawn point |
+   | Gate | `startGate`, `endGate` | teal + hatch (start = green / end = gold) | course start vs finish — same "gate" base, hatch tells them apart |
+   | Zone change | `zoneChanger` | magenta | walk-in zone 1↔2 transition |
+   | Upgrade box | `upgradeBox`, `localUpgrades`, `JumpToStateButton` | orange (+ optional red/blue warning hatch — see the special-case above) | interaction box; **labelled** with what it sells (the static scene target). One colour because the label distinguishes them; the hatch only flags the two categories that warrant a glance-level warning (game-reshaping vs ability-granting) |
+   | Moving platform | `PlatformMover` | lime | carries the player (no instances in the demo, kept for completeness) |
+   | Clone | `clonesScript`, `clonesLoD` | purple | economy clones |
+   | Camera / trigger | `camSizeTrigger`, `camZoneScript`, `TutorialTextTrigger`, `MusicController`, `GenericSpriteDisabler` | grey | **purely cosmetic** — touch only camera/music/text/sprite visibility |
+
+3. **Landable terrain** — on the **`Ground` physics layer** (see below): one green base for both surfaces, with a **hatch** distinguishing solid/metal (grey) from mossy (green). This is where the tilemap ground `CompositeCollider2D` lands (no owning gameplay script, on the Ground layer — confirmed live: ground draws green, not the white passable-floor fallback, so the tilemap really is on the Ground layer). Note the metal/moss hatch is **box-only**, so composite ground shows the green outline without the surface-variant hatch (the variant is cosmetic-only anyway — see below).
+4. **Fallback** — `isTrigger` ? **yellow** ("unclassified trigger") : **white** "solid, passable" + a **black hatch** (a looks-solid-but-passable fake floor — kept its own base, *not* folded under ground, so it never reads as real ground; the hatch reinforces it).
+
+### The hatch (secondary colour channel)
+
+Where several interactions are **variants of one base interaction**, they share a base outline colour and are told apart by a **diagonal hatch fill** inside the box (a second sub-colour), rather than each consuming a distinct top-level colour (the palette was saturating). Groups using it: **gates** (start/end), **ground** (metal/moss), **long fall** (active/reset), **upgrade boxes** (a red/blue *warning* hatch on the two categories that warrant one — game-reshaping = red, ability-granting = blue; most boxes carry no hatch). The passable-floor fallback also carries a black hatch. Implementation: `ClassifyHitbox` returns `(base, hatch?, show)`; `UpdateHatch` draws **one tinted, repeating diagonal-stripe quad** per box — a single `MeshRenderer` (4-vert mesh) sampling a small `wrapMode=Repeat` stripe `Texture2D` (`MakeStripeTexture`, generated once), tinted per-instance by the mesh's vertex colours (the channel `Sprites/Default` reads reliably; an MPB `_Color` is set too for the `Unlit/Color` fallback). UVs tile the stripe at a constant *world* pitch (`HitboxHatchTileWorld`) so density is identical on every box regardless of size, and the texture's filtering means the fill **doesn't sub-pixel-shimmer** the way thin diagonal lines did. **Box colliders only** — the hatched categories are all boxes; other shapes get the base outline alone. The quad is inset to the same true edge as the outline (so stripes don't bleed past the collider) and draws just under the border (`sortingOrder` −1), so it reads as interior fill, not a second border. The legend shows each hatch as a small diagonal slash in the swatch.
+
+**Interaction scripts that don't actually draw.** `prestigeEnabler`, `tripBreakerScript` and `colouredBlockSwapper` are in the category table for completeness but do **not** surface as hitboxes in the demo: `prestigeEnabler` has 0 demo instances; the other two are manager `Singleton`s with no player-facing collider. The breaker (lights-off event) is *tripped by buying an `upgradeBox`* (the one whose `tripBreaker` flag is set — now flagged with the **red** upgrade hatch), and re-lighting is the `activateNextBreakerLights` upgrade — both are boxes, already labelled. So everything reachable in this category is an `upgradeBox` (orange + target label, + a red/blue hatch where warranted) — there's nothing distinct to split out a top-level colour for.
+
+**Upgrade boxes have two colliders.** Each box GameObject carries a tall solid body (`95×176`, non-trigger) **and** a thin trigger strip at the base (`80×4`, `isTrigger` — the activation pad that `OnTriggerStay2D` reads). Both belong to the same `upgradeBox`, so the target label is anchored on the **larger** collider (the body) — see `LargestColliderBounds`.
+
+### Ground: layer vs tag (and the passable-floor reveal)
+
+Solidity in IGTAP is a **physics layer**, not the tag. `Movement`'s grounding raycasts test `groundRaycastLayer` (an Inspector-assigned `LayerMask`); the **only** custom solid layer the game defines is `Ground` (confirmed: it's the only layer name referenced in any mask across the whole decompile). The `"Ground"` **tag** is read *after* a landing raycast hits, purely to pick the surface variant ([Movement.cs](../artifacts/decompiled/Movement.cs) ~L811): tagged ⇒ solid, untagged ⇒ mossy.
+
+Consequences the overlay exploits:
+
+- **Classify by layer, not tag.** A collider on the Ground layer but without the tag is still solid (it's mossy) — a tag check would miscolour it. Layer is the source of truth.
+- **The white fallback finds fake floors.** A non-trigger collider that is **not** on the Ground layer looks solid but is **passable** — the player falls through it. It drops to the white "solid, passable" base (+ black hatch), reading clearly against the green real-ground base. This is the direct answer to "is there a floor here I can pass through?" — exactly the kind of thing the north star demands the overlay reveal.
+
+### Ground variants: there are two, and they're cosmetic-only (for now)
+
+Mossy and solid ground share the green base and are told apart by the **hatch** (metal = grey, moss = green) rather than two separate colours, but per the decompile they **behave identically for movement** — every `groundTypes`-branch in `Movement` only changes particles, footstep SFX, or a "sweating"/tired audio-visual state; none alters jump force, speed, momentum or collision. They're still drawn distinctly per the north star ("any detectable difference is visible") and to future-proof — the full release may make the difference mechanical. Note the enum is misleadingly named: `groundTypes` is `{Metal, Mossy}`, but `touchedSolidGround()` sets the type to `Metal`, so **`Metal` == ordinary solid ground; there is no third surface type** in the demo.
+
+### Matching mechanics & the silent-rename failure mode
+
+Matching is by **string component name** (`GetComponent(string)`) because these are the game's own types in `Assembly-CSharp`, which we can't reference directly. If the game renames a class, that collider silently drops to the trigger/solid fallback — harmless for a diagnostic, but the names in `scriptCategories` are **the thing to re-check after a game update** (same failure mode as the `Movement` reflection field names). The completeness of the table was verified by sweeping every script with a collider interaction (`OnTrigger*`/`OnCollision*`) against the table — see [the mechanic-audit consumption](#per-instance-data-labels-consuming-the-mechanic-audit).
+
+A colour legend listing **every** category (including both fallbacks) is drawn top-right while the overlay is on (`DrawHitboxLegend`).
+
+## Per-instance data labels (consuming the mechanic audit)
+
+Beyond colour, the overlay draws **per-instance value labels** next to colliders where a colour alone can't tell two instances apart. `CollectHitboxLabel` (in the refresh sweep) queues `(worldPos, worldSize, text, colour)` tuples; `DrawHitboxLabels` (in `OnGUI`) projects them world→screen and draws them. Values are read from the game's serialized fields by **reflection** (lazy-resolved `FieldInfo`, same pattern as the `Movement` fields), since the types aren't referencable. A per-sweep `HashSet` of script instances (`FirstLabelFor`) ensures **one label per instance** even when a box owns more than one collider, so labels don't stack.
+
+Three mechanics are labelled today:
+
+- **Springs** — all three `[SerializeField]` floats, stacked one per line: `s{strength}` / `u{upForce}` / `lock{movementLock}` (the 4th field `anim` is purely visual, skipped). All three are shown because all three materially change the launch — see the spring deep-dive below for the formula, why `upForce` dominates, and the value continuum.
+- **Long-fall volumes** — active ones show `{mult}x fall` (the fall-speed multiplier, 1.1 vs 2.2); inert ones show `reset` (they only force `cutsceneMode→none`). The active/inert split is read from the serialized `NewCutsceneMode` enum (`longfall` == active) with a `longFallMult > 0` fallback.
+- **Upgrade boxes** — *what the box sells*, e.g. `dash`, `prestige`, `cloneMult`, `increasedWatts`. The 43 Overworld boxes share one orange colour but sell 18 distinct things (including the 6 route-critical movement-ability unlocks), so the label is the only way to read a given box. The target is the **static scene** value (`upgrade`/`globalUpgrade`/ `movementUpgrade` enums, mirrored in `ReadUpgradeTarget`); the **cost** is deliberately *not* shown because it's runtime/save-dependent and a static number would mislead.
+
+**Label rendering.** Labels are **sized to the collider's on-screen footprint** (font ≈ 45% of the box's projected height, clamped to 11–28 px) so a big 400u long-fall volume gets large readable text and a small far-zoom box stays legible without overflowing. Each label is drawn with a **full 8-direction black outline** under the coloured fill, so coloured text reads on any background. The box height→pixels projection reuses the ortho `2*orthographicSize ↔ Screen.height` relationship (same basis as the line-width px conversion).
+
+**Springs (the first labelled mechanic, and the template for the rest).** `SpringScript` carries per-instance `strength`, `upForce`, `movementLock` (all `[SerializeField]`), and `hitSpring(upForce, strength, movementLock, transform.up)` scales launch directly by them: `Velocity.y = upForce*9 + up.y*strength*3`, plus two `addMomentum` calls (`upForce/4` up, and `(up.x*1.6, up.y/4)·strength` — the horizontal throw lives **entirely** in momentum, since the hard `Velocity` set is x=0). `movementLock` is the post-launch air-steering lockout (`Invoke("cancelSpringCutscene", movementLock)`) — route-relevant for when control returns. Extracting the **actual** placed values (via `tools/assetparse/mechanic_values.py`, below) proved the demo springs are a **continuum, not a small/big binary**: `strength` takes ~13 distinct values across **80–300** (most common 115), `upForce` ∈ {30, 50, 70}, `movementLock` mostly 0.3 (one 0.25). So a two-tier "small/big" colour split would *lie* at the boundary; the honest representation is one Spring colour + the **numbers** on each pad (rounded to 3 dp because Unity's float serialization prints e.g. `0.30000001`).
+
+**Spring direction is `transform.up`, and springs ARE rotated — captured in both the live read and the static dump.** The launch direction is the spring's own `transform.up`; an axis-aligned upright spring (`up == Vector2.up`) even skips the movement-lock cutscene (`hitSpring` sets `cutsceneMode = none`), while an angled one invokes `cancelSpringCutscene` after `movementLock`. The live `IGTAS_SPRING_DIAG` diagnostic (logs each spring's `eulerAngles.z`/`transform.up` once) settled the orientation: demo springs face **all four cardinals** — `eulerZ` ∈ {0, 90, 180, 270}, `up` tracking it exactly (e.g. `eulerZ=90 → up=(-1,0)`, left-launching; level1 even has a `strength=300` one facing **down**). The rotation is on each spring's **own** transform (`parentEulerZ=0` everywhere). `extract_scene.py` now stores this per spring (`eulerZ`/`up`), validated cardinal-for-cardinal against the live diagnostic — the dump and the live read agree, so either is trustworthy. (The earlier "the static read can't see rotation" belief was a storage gap, not a read failure: `m_LocalRotation` reads back fine; the rotation just wasn't being recorded. See [tools/assetparse/README.md](../tools/assetparse/README.md).) Each spring is drawn with a **launch-direction arrow** (`UpdateSpringArrow`): a single textured quad (a generated chevron texture, `MakeArrowTexture`, same model as the hatch — one shared material, per-instance tint via MPB) whose local +V axis is the live `transform.up`, so the arrow rotates with the pad and shows the throw direction at a glance even for the down-facing and sideways springs. Sized to a clamped fraction of the pad's smaller world extent (readable at any zoom), tinted spring-pink, drawn on top of the outline.
+
+### The audit tool
+
+The overlay's colour/hatch/label decisions are grounded in the **scene-asset mechanic audit** (findings digest in [README.md](README.md)) — the per-instance serialized values of every gameplay script, extracted with `tools/assetparse/mechanic_values.py`. The audit is complete; the values it surfaced (`SpringScript`, `spikeScript`, `courseScript`/`upgradeBox`, `longFallColliderController`, and the `Movement` master physics block → [movement-constants.md](movement-constants.md)) are what the categories and labels above reflect. The tool is only re-run when extracting against a new build — its invocation lives with it in [tools/assetparse/README.md](../tools/assetparse/README.md); for overlay work you read the extracted values, not the tool.
+
+## Touch-point / determinism posture
+
+A diagnostic, held to the touch-point gate:
+
+- **Read-only.** Reads colliders and draws lines on *new child objects*; never mutates game state, RNG, or `Rigidbody2D`. Reflection into `SpringScript`/etc. is **read-only** field access. Adds GameObjects but touches nothing the game reads.
+- **Off by default**, toggled manually. No effect on an ordinary session until F4.
+- **Render-rate only.** `UpdateHitboxOverlay` runs from `Update`, never `FixedUpdate`, so it cannot perturb the 50 Hz lockstep, and it is **explicitly skipped while the determinism harness is active** (`hitboxOverlayEnabled && !harnessActive`). Headless `-nographics` runs have no rendering and no F4, so it is inert there anyway (and `DrawHitboxLabels` no-ops when `Camera.main` is null).
+
+## Line width & the config-persistence trap
+
+Two hard-won facts; both cost real debugging time.
+
+**The world is huge and the camera zoom is dynamic, so width is in *pixels*, not world units.** Every gameplay collider sits at **Z = 0**; the camera ([cameraMover.cs](../artifacts/decompiled/cameraMover.cs)) is **orthographic, parked at Z = −100, and continuously lerps its `orthographicSize`** (observed ~550, i.e. a ~1100-unit-tall view) toward per-zone targets in `LateUpdate`. A fixed *world-space* line width therefore reads as **sub-pixel** (a `0.04`-unit line in a ~1100u view is ~0.004% of screen height) and **shimmers / pops in and out** as the zoom lerp and the camera's integer position snap (`Mathf.Round`) drift the thin line across the single-pixel coverage threshold. The fix: specify width in **screen pixels** and convert to world units against the *live* `orthographicSize` every refresh (`WorldWidthForPixels`): `px * (2*orthographicSize / Screen.height)`. Re-resolving each frame holds a stable on-screen thickness at **any** zoom, which a fixed world width can't. Also use `LineAlignment.TransformZ` (lines lie in the world XY plane), **not** `View` — `View` billboards each segment to the camera and collapses to near-zero width on this dead-on top-down camera (an easy wrong turn).
+
+**`Camera.main` is re-resolved every refresh, never cached.** In this Unity version it's a tagged `FindGameObjectsWithTag("MainCamera")` lookup, not a cached property, so it has a small per-call cost — but caching risks a stale reference across scene loads (the camera can be destroyed/recreated), which would silently break the conversion. The lookup is negligible next to the per-refresh `FindObjectsOfType<Collider2D>()` sweep, so correctness wins. If it ever shows in a profile, cache and **invalidate on `sceneLoaded`** — don't cache blind. (Layer indices, by contrast, *are* cached — `GroundLayer` — because they're fixed at build time.)
+
+**Why the tuning values are compile-time constants, not BepInEx config.** The expensive lesson. `Config.Bind` **persists its value to `BepInEx/config/IGTAS.cfg` on first run, and the file then wins over the code default forever.** Shipping a *new* default does **not** reach any install that already has the `.cfg` — and BepInEx can't distinguish a user-changed value from a stale old default, so it can't "prefer code unless overridden." During development, three rounds of default changes (`0.04`→`0.08`→pixel-based) produced **zero** visible change because the deployed plugin kept loading the original persisted `LineWidth = 0.08` off disk; only a runtime log probe (printing the *actual* loaded value) exposed it. For a diagnostic with one correct value there's no upside to persistence and a large footgun, so `HitboxLineWidthPx` / `HitboxUpdateRate` are `const`: a code change is always authoritative, every install picks it up on update, nothing is written to disk. **General rule (also in [CLAUDE.md](../CLAUDE.md)): only `Config.Bind` a value we intend users to change and that *should* persist** (keybinds like `ToggleHitboxes`). Tuning knobs with one right answer belong in code. (A plugin-wide `Config.Bind` audit against this rule is a known follow-up.)
+
+## Known limitations / future work
+
+- **`FindObjectsOfType<Collider2D>()` every refresh.** The naive part inherited from HitboxViewer's design. IGTAP can spawn many clones, so a populated zone may hold a lot of colliders. The `HitboxUpdateRate` throttle is the current mitigation; if it bites, scope the scan (per-zone, or rescan only on scene change) rather than sweeping the whole scene each time.
+- **Tuning + colours are hard-coded constants**, not config-exposed — deliberate (see the config-persistence trap).
+- **Capsule colliders are box-approximated.**
+- **No dirty-check redraw:** every refresh recomputes outlines and rewrites each hatch quad's verts/UVs. A hatched box is now 1 outline `LineRenderer` + 1 hatch `MeshRenderer` (down from 1 + up to 4 lines), so hatched categories cost ~2× a plain one, not ~5×. HitboxViewer caches and skips unchanged colliders; we can add the same `_ShouldBeUpdated`-style check if per-frame cost matters once update rate is dialled in.
+- **Hatch is box-only.** `UpdateHatch` only fills `BoxCollider2D`s. The hatched categories (gates, long-fall, passable, the upgrade-box warnings) are all boxes, so the only live miss is **tilemap ground**: its `CompositeCollider2D` is on the Ground layer, so it shows the green outline but no metal/moss hatch. The surface variant is cosmetic-only today (see above), so this is not a route concern; extending the hatch to composite paths means a stripe mesh fitting each polygon path (the stripe texture itself is shape-agnostic).
+- **Polygon/composite inset is approximate on concave corners.** `InsetClosedPath` offsets each vertex inward along its angle bisector with a miter clamp — exact for convex spans (the bulk of tilemap ground), but a tight concave notch is offset slightly imperfectly. Invisible at the 1px default line width; only matters if the width is cranked up.
+- **Hatch render-sort against game sprites is shader-dependent.** The stripe quad relies on `Sprites/Default` (transparent queue) blending its texture alpha and honouring `sortingOrder`; the `Unlit/Color`/`Hidden/Internal-Colored` fallbacks may not blend the alpha or sort identically. Confirmed only on the primary shader path — re-verify if the shader fallback is ever hit.
+- **Label legibility** uses an 8-direction black outline under the coloured text. Adequate as a diagnostic; could become a proper background box if it reads muddy at some zooms or when many labels overlap in a clone-dense area.
+- **Label overlap in dense areas.** Labels are not collision-resolved against each other, so a tight cluster of boxes (or a populated clone zone) can overprint. The per-instance dedup stops a single box stacking on itself, but not neighbour-on-neighbour. Acceptable for a diagnostic; a future pass could nudge overlapping labels apart or fade distant ones.
+- **Upgrade-box labels show the target, not the cost.** Cost is runtime/save-dependent (a static number would mislead — see the audit). A live cost readout would need reading the box's runtime state during play, not the serialized field.
+- **Per-data-kind label styling** is still flat (one bold style for all). The audit floated styling economy vs physics values differently; not yet done.

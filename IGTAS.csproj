@@ -4,7 +4,7 @@
     <TargetFramework>net472</TargetFramework>
     <AssemblyName>IGTAS</AssemblyName>
     <Product>TAS plugin for IGTAP</Product>
-    <Version>1.1.1</Version>
+    <Version>1.3.0</Version>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
     <RestoreAdditionalProjectSources>
@@ -13,6 +13,18 @@
       https://nuget.samboy.dev/v3/index.json
     </RestoreAdditionalProjectSources>
     <RootNamespace>IGTAS</RootNamespace>
+
+    <!-- Reproducible build + scrub local build path from the shipped DLL -->
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=.</PathMap>
+
+    <!-- artifacts/ holds everything that isn't plugin source or committed.
+         Exclude from ALL default globs so MSBuild ignores it completely. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);artifacts/**</DefaultItemExcludes>
+
+    <!-- Folder containing the game's managed assemblies (the *_Data/Managed dir).
+         Override on other machines with: dotnet build -p:GameManagedDir="/path/to/IGTAP_Data/Managed" -->
+    <GameManagedDir Condition="'$(GameManagedDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\IGTAP_TAS\IGTAPsnfDemo_Data\Managed</GameManagedDir>
   </PropertyGroup>
 
   <ItemGroup>
@@ -21,14 +33,19 @@
     <PackageReference Include="BepInEx.PluginInfoProps" Version="2.*" />
     <PackageReference Include="UnityEngine.Modules" Version="2021.3.33" IncludeAssets="compile" />
   </ItemGroup>
-  
+
   <ItemGroup Condition="'$(TargetFramework.TrimEnd(`0123456789`))' == 'net'">
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
   </ItemGroup>
-  
+
   <ItemGroup>
     <Reference Include="Unity.InputSystem">
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\IGTAP_TAS\IGTAPsnfDemo_Data\Managed\Unity.InputSystem.dll</HintPath>
+      <HintPath>$(GameManagedDir)\Unity.InputSystem.dll</HintPath>
     </Reference>
+  </ItemGroup>
+
+  <!-- The Input tests live standalone under tests/, ignore them here. -->
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
 </Project>
